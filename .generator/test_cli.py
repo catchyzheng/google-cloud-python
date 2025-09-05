@@ -15,14 +15,16 @@
 import json
 import logging
 import os
+import pathlib
 import subprocess
+import unittest.mock
 from unittest.mock import MagicMock, mock_open
 
 import pytest
-
 from cli import (
     GENERATE_REQUEST_FILE,
     BUILD_REQUEST_FILE,
+    RELEASE_INIT_REQUEST_FILE,
     LIBRARIAN_DIR,
     REPO_DIR,
     _build_bazel_target,
@@ -30,14 +32,22 @@ from cli import (
     _copy_files_needed_for_post_processing,
     _determine_bazel_rule,
     _get_library_id,
+    _get_libraries_to_prepare_for_release,
     _locate_and_extract_artifact,
+    _process_version_file,
     _read_json_file,
+    _read_text_file,
     _run_individual_session,
     _run_nox_sessions,
     _run_post_processor,
+    _update_global_changelog,
+    _update_version_for_library,
+    _write_json_file,
+    _write_text_file,
     handle_build,
     handle_configure,
     handle_generate,
+    handle_release_init,
 )
 
 
@@ -90,6 +100,40 @@ def mock_generate_request_data_for_nox():
             {"path": "google/mock/v1"},
         ],
     }
+
+
+@pytest.fixture
+def mock_release_init_request_file(tmp_path, monkeypatch):
+    """Creates the mock request file at the correct path inside a temp dir."""
+    # Create the path as expected by the script: .librarian/release-request.json
+    request_path = f"{LIBRARIAN_DIR}/{RELEASE_INIT_REQUEST_FILE}"
+    request_dir = tmp_path / os.path.dirname(request_path)
+    request_dir.mkdir()
+    request_file = request_dir / os.path.basename(request_path)
+
+    request_content = {
+        "libraries": [
+            {
+                "id": "google-cloud-another-library",
+                "apis": [{"path": "google/cloud/another/library/v1"}],
+                "release_triggered": False,
+                "version": "1.2.3",
+                "changes": [],
+            },
+            {
+                "id": "google-cloud-language",
+                "apis": [{"path": "google/cloud/language/v1"}],
+                "release_triggered": True,
+                "version": "1.2.3",
+                "changes": [],
+            },
+        ]
+    }
+    request_file.write_text(json.dumps(request_content))
+
+    # Change the current working directory to the temp path for the test.
+    monkeypatch.chdir(tmp_path)
+    return request_file
 
 
 def test_get_library_id_success():
@@ -424,7 +468,7 @@ def test_read_valid_json(mocker):
     assert result == {"key": "value"}
 
 
-def test_file_not_found(mocker):
+def test_json_file_not_found(mocker):
     """Tests behavior when the file does not exist."""
     mocker.patch("builtins.open", side_effect=FileNotFoundError("No such file"))
 
@@ -454,3 +498,168 @@ def test_clean_up_files_after_post_processing_success(mocker):
     mock_shutil_rmtree = mocker.patch("shutil.rmtree")
     mock_os_remove = mocker.patch("os.remove")
     _clean_up_files_after_post_processing("output", "library_id")
+
+
+def test_get_libraries_to_prepare_for_release(mock_release_init_request_file):
+    """
+    Tests that only libraries with the `release_triggered` field set to `True` are
+    returned.
+    """
+    request_data = _read_json_file(f"{LIBRARIAN_DIR}/{RELEASE_INIT_REQUEST_FILE}")
+    libraries_to_prep_for_release = _get_libraries_to_prepare_for_release(request_data)
+    assert len(libraries_to_prep_for_release) == 1
+    assert "google-cloud-language" in libraries_to_prep_for_release[0]["id"]
+    assert libraries_to_prep_for_release[0]["release_triggered"]
+
+
+def test_handle_release_init_success(mocker, mock_release_init_request_file):
+    """
+    Simply tests that `handle_release_init` runs without errors.
+    """
+    mocker.patch("cli._update_global_changelog", return_value=None)
+    mocker.patch("cli._update_version_for_library", return_value=None)
+    handle_release_init()
+
+
+def test_handle_release_init_fail():
+    """
+    Tests that handle_release_init fails to read `librarian/release-init-request.json`.
+    """
+    with pytest.raises(ValueError):
+        handle_release_init()
+
+
+def test_read_valid_text_file(mocker):
+    """Tests reading a valid text file."""
+    mock_content = "some text"
+    mocker.patch("builtins.open", mocker.mock_open(read_data=mock_content))
+    result = _read_text_file("fake/path.txt")
+    assert result == "some text"
+
+
+def test_text_file_not_found(mocker):
+    """Tests behavior when the file does not exist."""
+    mocker.patch("builtins.open", side_effect=FileNotFoundError("No such file"))
+
+    with pytest.raises(FileNotFoundError):
+        _read_text_file("non/existent/path.text")
+
+
+def test_write_text_file():
+    """Tests writing a text file.
+    See https://docs.python.org/3/library/unittest.mock.html#mock-open
+    """
+    m = mock_open()
+
+    with unittest.mock.patch("cli.open", m):
+        _write_text_file("fake_path.txt", "modified content")
+
+        handle = m()
+        handle.write.assert_called_once_with("modified content")
+
+
+def test_write_json_file():
+    """Tests writing a json file.
+    See https://docs.python.org/3/library/unittest.mock.html#mock-open
+    """
+    m = mock_open()
+
+    expected_dict = {"name": "call me json"}
+
+    with unittest.mock.patch("cli.open", m):
+        _write_json_file("fake_path.json", expected_dict)
+
+        handle = m()
+        # Get all the arguments passed to the mock's write method
+        # and join them into a single string.
+        written_content = "".join(
+            [call.args[0] for call in handle.write.call_args_list]
+        )
+
+        # Create the expected output string with the correct formatting.
+        expected_output = json.dumps(expected_dict, indent=2) + "\n"
+
+        # Assert that the content written to the mock file matches the expected output.
+        assert written_content == expected_output
+
+
+def test_update_global_changelog(mocker, mock_release_init_request_file):
+    """Tests that the global changelog is updated
+    with the new version for a given library.
+    See https://docs.python.org/3/library/unittest.mock.html#mock-open
+    """
+    m = mock_open()
+    request_data = _read_json_file(f"{LIBRARIAN_DIR}/{RELEASE_INIT_REQUEST_FILE}")
+    libraries = _get_libraries_to_prepare_for_release(request_data)
+
+    with unittest.mock.patch("cli.open", m):
+        mocker.patch(
+            "cli._read_text_file", return_value="[google-cloud-language==1.2.2]"
+        )
+        _update_global_changelog("source", "output", libraries)
+
+        handle = m()
+        handle.write.assert_called_once_with("[google-cloud-language==1.2.3]")
+
+
+def test_update_version_for_library_success(mocker):
+    m = mock_open()
+
+    mock_rglob = mocker.patch(
+        "pathlib.Path.rglob", return_value=[pathlib.Path("repo/gapic_version.py")]
+    )
+    mock_shutil_copy = mocker.patch("shutil.copy")
+    mock_content = '__version__ = "1.2.2"'
+    mock_json_metadata = {"clientLibrary": {"version": "0.1.0"}}
+
+    with unittest.mock.patch("cli.open", m):
+        mocker.patch("cli._read_text_file", return_value=mock_content)
+        mocker.patch("cli._read_json_file", return_value=mock_json_metadata)
+        _update_version_for_library(
+            "repo", "output", "packages/google-cloud-language", "1.2.3"
+        )
+
+        handle = m()
+        assert handle.write.call_args_list[0].args[0] == '__version__ = "1.2.3"'
+
+        # Get all the arguments passed to the mock's write method
+        # and join them into a single string.
+        written_content = "".join(
+            [call.args[0] for call in handle.write.call_args_list[1:]]
+        )
+        # Create the expected output string with the correct formatting.
+        assert (
+            written_content
+            == '{\n  "clientLibrary": {\n    "version": "1.2.3"\n  }\n}\n'
+        )
+
+
+def test_update_version_for_library_failure(mocker):
+    """Tests that value error is raised if the version string cannot be found"""
+    m = mock_open()
+
+    mock_rglob = mocker.patch(
+        "pathlib.Path.rglob", return_value=[pathlib.Path("repo/gapic_version.py")]
+    )
+    mock_content = "not found"
+    with pytest.raises(ValueError):
+        with unittest.mock.patch("cli.open", m):
+            mocker.patch("cli._read_text_file", return_value=mock_content)
+            _update_version_for_library(
+                "repo", "output", "packages/google-cloud-language", "1.2.3"
+            )
+
+
+def test_process_version_file_success():
+    version_file_contents = '__version__ = "1.2.2"'
+    new_version = "1.2.3"
+    modified_content = _process_version_file(
+        version_file_contents, new_version, "file.txt"
+    )
+    assert modified_content == f'__version__ = "{new_version}"'
+
+
+def test_process_version_file_failure():
+    """Tests that value error is raised if the version string cannot be found"""
+    with pytest.raises(ValueError):
+        _process_version_file("", "", "")
